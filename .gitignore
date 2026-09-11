@@ -1,0 +1,7 @@
+# Intel/Microsoft proprietary inputs extracted from Windows: never commit
+camera-pkgs/
+*.tar
+*.zip
+# decoded/ is derived from those files; kept local by default (see README)
+decoded/
+__pycache__/
