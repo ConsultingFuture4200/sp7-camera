@@ -1,0 +1,896 @@
+From 812f8041c2c1b93c0dac9d0768787eb1d0d1fe8d Mon Sep 17 00:00:00 2001
+From: sp7 <sp7@local>
+Date: Fri, 11 Sep 2026 21:04:19 -0700
+Subject: [PATCH] media: intel/ipu4: Surface Pro 7 fixes from
+ thisiscamk/sp7-ipu4-camera
+
+Squashed delta of https://github.com/thisiscamk/sp7-ipu4-camera @ da7fd41
+over the ruslanbay/ipu4-drivers 56-patch v6.19 series. Takes the port from
+"loads but streams nothing" to validated RAW10 capture on both SP7 sensors
+(front ov5693 2592x1944, rear ov8865 3264x2448), per its autotest/RESULT.md
+dated 2026-07-15.
+
+Fixes carried:
+ 1. Store av->pix_fmt in vidioc_s_fmt_vid_cap - single-planar S_FMT never
+    recorded the format the link validator reads -> EPIPE on STREAMON.
+ 2. Bound the media-graph walks in is_support_vc/ipu_isys_query_sensor_info -
+    TPG pipelines ping-pong two entities forever -> unkillable kernel spin.
+ 3. Restore is_external()/ip->external in the video-node link_validate
+    (dropped in the 6.19 rewrite) - without it TPG pipelines oops in
+    __media_pipeline_stop and sensors never stream.
+ 4. Use media_pipeline_stop_for_vc() in the prepare_streaming error path -
+    upstream media_pipeline_stop() walks uninitialized pads -> NULL deref.
+ 5. Add the missing pm_runtime_put in ipu_buttress_authenticate()'s error
+    path - leaked once per video-node open (~50 at load via udev), pinning
+    the psys IOMMU so the isys power island could never cycle.
+ 6. Configure D-PHY building block 10 in ipu4p_isys_bb_cfg ({10, 13, 32,
+    0x15}) - the front sensor's analog front end was never programmed; the
+    front camera is totally silent without this. Do NOT configure bb 8 the
+    same way: it injects D-PHY sync errors on bb 10.
+ 7. Stream-start verification with sensor bounce + buffer parking - makes
+    the front camera's marginal D-PHY link (25-40% lock per start) reliable.
+ 8. Diagnostics: runtime-writable params csi2_fw_src, csi2_csettle/dsettle,
+    phy_bb_extra/phy_afe_extra/phy_jsl_bits.
+ 9. Fix ipu_isys_buffer_list_queue() double-booking buffers on
+    INCOMING|SET_STATE -> BUG at lib/list_debug.c:32.
+10. Fix BUTTRESS_POWER_TIMEOUT: feeds readl_poll_timeout()'s microseconds
+    argument but was a bare 200 - 200us for a power-island handshake where
+    ipu6 uses 200ms. Cold power-up times out and latches runtime PM error.
+11. ov5693: disable the 2x2-binned modes (SP7 quirk) - binned modes never
+    achieve D-PHY lock on this link (0/15+ restarts).
+12. Unlink the debug capture nodes (new isys param debug_capture_links=1
+    restores them) so apps reach the CSI2 BE SOC RAW_SOC pin, the only
+    output route that writes pixel-perfect line-addressed raster.
+
+Origin: https://github.com/thisiscamk/sp7-ipu4-camera
+Base:   https://github.com/ruslanbay/ipu4-drivers @ 4ea3612
+---
+ drivers/media/i2c/ov5693.c                 |  26 ++--
+ drivers/media/pci/intel/ipu-buttress.c     |   9 +-
+ drivers/media/pci/intel/ipu-buttress.h     |  11 +-
+ drivers/media/pci/intel/ipu-isys-csi2-be.c |   1 +
+ drivers/media/pci/intel/ipu-isys-csi2.c    |  63 ++++++++
+ drivers/media/pci/intel/ipu-isys-csi2.h    |   1 +
+ drivers/media/pci/intel/ipu-isys-queue.c   | 170 ++++++++++++++++++++-
+ drivers/media/pci/intel/ipu-isys-subdev.c  |   7 +-
+ drivers/media/pci/intel/ipu-isys-video.c   |  88 ++++++++++-
+ drivers/media/pci/intel/ipu-isys-video.h   |  21 +++
+ drivers/media/pci/intel/ipu-isys.c         |  10 ++
+ drivers/media/pci/intel/ipu4/ipu4-isys.c   | 119 ++++++++++++---
+ 12 files changed, 480 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/media/i2c/ov5693.c b/drivers/media/i2c/ov5693.c
+index d8b8303ad..cd705922d 100644
+--- a/drivers/media/i2c/ov5693.c
++++ b/drivers/media/i2c/ov5693.c
+@@ -870,29 +870,20 @@ static int ov5693_set_fmt(struct v4l2_subdev *sd,
+ 	const struct v4l2_rect *crop;
+ 	struct v4l2_mbus_framefmt *fmt;
+ 	unsigned int hratio, vratio;
+-	unsigned int width, height;
+ 	unsigned int hblank;
+ 	int exposure_max;
+ 
+ 	crop = __ov5693_get_pad_crop(ov5693, state, format->pad, format->which);
+ 
+ 	/*
+-	 * Align to two to simplify the binning calculations below, and clamp
+-	 * the requested format at the crop rectangle
++	 * Surface Pro 7 (IPU4) quirk: 2x2-binned modes never achieve D-PHY
++	 * clock-lane lock on this marginal link (0/15+ sensor restarts per
++	 * stream start, vs ~60-70% lock per attempt at full resolution).
++	 * Disable binning and always output the full crop; the receiver
++	 * side (libcamera software ISP) scales to the requested size.
+ 	 */
+-	width = clamp_t(unsigned int, ALIGN(format->format.width, 2),
+-			OV5693_MIN_CROP_WIDTH, crop->width);
+-	height = clamp_t(unsigned int, ALIGN(format->format.height, 2),
+-			 OV5693_MIN_CROP_HEIGHT, crop->height);
+-
+-	/*
+-	 * We can only support setting either the dimensions of the crop rect
+-	 * or those dimensions binned (separately) by a factor of two.
+-	 */
+-	hratio = clamp_t(unsigned int,
+-			 DIV_ROUND_CLOSEST(crop->width, width), 1, 2);
+-	vratio = clamp_t(unsigned int,
+-			 DIV_ROUND_CLOSEST(crop->height, height), 1, 2);
++	hratio = 1;
++	vratio = 1;
+ 
+ 	fmt = __ov5693_get_pad_format(ov5693, state, format->pad,
+ 				      format->which);
+@@ -1119,7 +1110,8 @@ static int ov5693_enum_frame_size(struct v4l2_subdev *sd,
+ 	struct ov5693_device *ov5693 = to_ov5693_sensor(sd);
+ 	struct v4l2_rect *__crop;
+ 
+-	if (fse->index > 1 || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
++	/* Index 1 (the 2x2-binned size) is disabled: see ov5693_set_fmt() */
++	if (fse->index > 0 || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
+ 		return -EINVAL;
+ 
+ 	__crop = __ov5693_get_pad_crop(ov5693, state, fse->pad, fse->which);
+diff --git a/drivers/media/pci/intel/ipu-buttress.c b/drivers/media/pci/intel/ipu-buttress.c
+index c5d5247eb..2081d2f5a 100644
+--- a/drivers/media/pci/intel/ipu-buttress.c
++++ b/drivers/media/pci/intel/ipu-buttress.c
+@@ -535,7 +535,7 @@ int ipu_buttress_power(struct device *dev,
+ 				 val, ((val & ctrl->pwr_sts_mask) == pwr_sts),
+ 				 100, BUTTRESS_POWER_TIMEOUT);
+ 	if (ret)
+-	dev_err(&isp->pdev->dev,
++		dev_err(&isp->pdev->dev,
+ 			"Change power status timeout with 0x%x\n", val);
+ 
+ 	ctrl->started = !ret && on;
+@@ -908,6 +908,13 @@ int ipu_buttress_authenticate(struct ipu_device *isp)
+ 	dev_info(&isp->pdev->dev, "CSE authenticate_run done\n");
+ 
+ iunit_power_off:
++	/*
++	 * Balance the pm_runtime_get_sync() above: without this every
++	 * authentication (one per video node open) leaks a reference on
++	 * the psys iommu, so neither MMU ever runtime-suspends and the
++	 * isys power island can never be cycled after an error.
++	 */
++	pm_runtime_put(&isp->psys_iommu->dev);
+ 	mutex_unlock(&b->auth_mutex);
+ 
+ 	return rval;
+diff --git a/drivers/media/pci/intel/ipu-buttress.h b/drivers/media/pci/intel/ipu-buttress.h
+index e751703eb..9ed134497 100644
+--- a/drivers/media/pci/intel/ipu-buttress.h
++++ b/drivers/media/pci/intel/ipu-buttress.h
+@@ -12,7 +12,16 @@
+ #define IPU_BUTTRESS_NUM_OF_PLL_CKS	3
+ #define IPU_BUTTRESS_TSC_CLK		19200000
+ 
+-#define BUTTRESS_POWER_TIMEOUT			200
++/*
++ * readl_poll_timeout() takes microseconds; a bare 200 gave the power
++ * island only 200us to complete the buttress handshake. That passes
++ * while the rails are warm (load-time storms, back-to-back streams)
++ * but a cold power-up after the island has been off for hours takes
++ * longer, times out, and latches the device into runtime PM error
++ * state until reboot. The ipu6 driver uses 200ms for the same
++ * handshake; match it.
++ */
++#define BUTTRESS_POWER_TIMEOUT			(200 * USEC_PER_MSEC)
+ 
+ #define BUTTRESS_PS_FREQ_STEP		25U
+ #define BUTTRESS_MIN_FORCE_PS_FREQ	(BUTTRESS_PS_FREQ_STEP * 8)
+diff --git a/drivers/media/pci/intel/ipu-isys-csi2-be.c b/drivers/media/pci/intel/ipu-isys-csi2-be.c
+index 2c1fc7123..0a5aae625 100644
+--- a/drivers/media/pci/intel/ipu-isys-csi2-be.c
++++ b/drivers/media/pci/intel/ipu-isys-csi2-be.c
+@@ -266,6 +266,7 @@ int ipu_isys_csi2_be_init(struct ipu_isys_csi2_be *csi2_be,
+ 		 IPU_ISYS_ENTITY_PREFIX " CSI2 BE");
+ 	snprintf(csi2_be->av.vdev.name, sizeof(csi2_be->av.vdev.name),
+ 		 IPU_ISYS_ENTITY_PREFIX " CSI2 BE capture");
++	csi2_be->av.debug_link_only = true;
+ 	csi2_be->av.aq.css_pin_type = IPU_FW_ISYS_PIN_TYPE_RAW_NS;
+ 	v4l2_set_subdevdata(&csi2_be->asd.sd, &csi2_be->asd);
+ 	rval = v4l2_device_register_subdev(&isys->v4l2_dev, &csi2_be->asd.sd);
+diff --git a/drivers/media/pci/intel/ipu-isys-csi2.c b/drivers/media/pci/intel/ipu-isys-csi2.c
+index e188ebbf7..a387d019c 100644
+--- a/drivers/media/pci/intel/ipu-isys-csi2.c
++++ b/drivers/media/pci/intel/ipu-isys-csi2.c
+@@ -22,6 +22,35 @@
+ #define IPU_EOF_SEQID_TRACE
+ #include "ipu-trace-event.h"
+ 
++/*
++ * The IPU4P fw stream source ids for the CSI-2 receivers are not
++ * contiguous and the builtin mapping (see ipu_isys_csi2_init) is a
++ * best guess for this hardware. Allow overriding it at runtime
++ * (consulted at every stream start) so alternative mappings can be
++ * tested without reloading the module:
++ *   echo -1,-1,6 > /sys/module/intel_ipu4p_isys/parameters/csi2_fw_src
++ */
++static int csi2_fw_src[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
++module_param_array(csi2_fw_src, int, NULL, 0644);
++MODULE_PARM_DESC(csi2_fw_src,
++		 "Override ISYS fw stream source per CSI-2 index (-1 = builtin mapping)");
++
++unsigned int ipu_isys_csi2_get_fw_source(struct v4l2_subdev *sd)
++{
++	struct ipu_isys_csi2 *csi2 = to_ipu_isys_csi2(sd);
++
++	if (csi2->index < ARRAY_SIZE(csi2_fw_src) &&
++	    csi2_fw_src[csi2->index] >= 0) {
++		dev_info(&csi2->isys->adev->dev,
++			 "csi2-%u: fw source overridden to %d\n",
++			 csi2->index, csi2_fw_src[csi2->index]);
++		return IPU_FW_ISYS_STREAM_SRC_CSI2_PORT0 +
++			csi2_fw_src[csi2->index];
++	}
++
++	return csi2->asd.source;
++}
++
+ static const u32 csi2_supported_codes_pad_sink[] = {
+ 	MEDIA_BUS_FMT_Y10_1X10,
+ 	MEDIA_BUS_FMT_RGB565_1X16,
+@@ -254,6 +283,25 @@ static struct ipu_isys_pixelformat csi2_meta_pfmts[] = {
+ 
+ #define DIV_SHIFT	8
+ 
++/*
++ * The calculation below uses the spec-minimum A/B coefficients. On
++ * Surface Pro 7 the front ov5693 (419.2 MHz, x2) misses the initial
++ * SOT sync on roughly half the stream starts with the minimum values
++ * (one missed sync = non-recoverable, the whole stream storms with
++ * irq_ctrl0 status 0x400), while the rear ov8865 at 360 MHz x4 is
++ * stable. Allow overriding the settle counts at runtime to place them
++ * mid-window, e.g.:
++ *   echo 880 > /sys/module/intel_ipu4p_isys/parameters/csi2_dsettle
++ * Consulted at every stream start; -1 = use the calculated minimum.
++ */
++static int csi2_csettle = -1;
++module_param(csi2_csettle, int, 0644);
++MODULE_PARM_DESC(csi2_csettle, "Override clock-lane settle count (-1 = calc)");
++
++static int csi2_dsettle = -1;
++module_param(csi2_dsettle, int, 0644);
++MODULE_PARM_DESC(csi2_dsettle, "Override data-lane settle count (-1 = calc)");
++
+ static uint32_t calc_timing(s32 a, int32_t b, int64_t link_freq, int32_t accinv)
+ {
+ 	return accinv * a + (accinv * b * (500000000 >> DIV_SHIFT)
+@@ -289,6 +337,17 @@ ipu_isys_csi2_calc_timing(struct ipu_isys_csi2 *csi2,
+ 	dev_dbg(&csi2->isys->adev->dev, "dtermen %u\n", timing->dtermen);
+ 	dev_dbg(&csi2->isys->adev->dev, "dsettle %u\n", timing->dsettle);
+ 
++	if (csi2_csettle >= 0) {
++		dev_info(&csi2->isys->adev->dev, "csettle override %u -> %d\n",
++			 timing->csettle, csi2_csettle);
++		timing->csettle = csi2_csettle;
++	}
++	if (csi2_dsettle >= 0) {
++		dev_info(&csi2->isys->adev->dev, "dsettle override %u -> %d\n",
++			 timing->dsettle, csi2_dsettle);
++		timing->dsettle = csi2_dsettle;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -714,6 +773,8 @@ int ipu_isys_csi2_init(struct ipu_isys_csi2 *csi2,
+ 	src = index ? (index + 5) : (index + 3);
+ #endif
+ 	csi2->asd.source = IPU_FW_ISYS_STREAM_SRC_CSI2_PORT0 + src;
++	dev_info(&isys->adev->dev, "CSI-2 %u: default fw source %d\n",
++		 index, src);
+ 	csi2_supported_codes[CSI2_PAD_SINK] = csi2_supported_codes_pad_sink;
+ 
+ 	for (i = 0; i < NR_OF_CSI2_SOURCE_PADS; i++)
+@@ -763,6 +824,7 @@ int ipu_isys_csi2_init(struct ipu_isys_csi2 *csi2,
+ 			 IPU_ISYS_ENTITY_PREFIX " CSI-2 %u capture %d",
+ 			 index, i);
+ 		csi2->av[i].isys = isys;
++		csi2->av[i].debug_link_only = true;
+ 		csi2->av[i].aq.css_pin_type = IPU_FW_ISYS_PIN_TYPE_MIPI;
+ 		csi2->av[i].pfmts = ipu_isys_pfmts_packed;
+ 		csi2->av[i].try_fmt_vid_mplane = csi2_try_fmt;
+@@ -793,6 +855,7 @@ int ipu_isys_csi2_init(struct ipu_isys_csi2 *csi2,
+ 	snprintf(csi2->av_meta.vdev.name, sizeof(csi2->av_meta.vdev.name),
+ 		 IPU_ISYS_ENTITY_PREFIX " CSI-2 %u meta", index);
+ 	csi2->av_meta.isys = isys;
++	csi2->av_meta.debug_link_only = true;
+ 	csi2->av_meta.aq.css_pin_type = IPU_FW_ISYS_PIN_TYPE_MIPI;
+ 	csi2->av_meta.pfmts = csi2_meta_pfmts;
+ 	csi2->av_meta.try_fmt_vid_mplane = csi2_try_fmt;
+diff --git a/drivers/media/pci/intel/ipu-isys-csi2.h b/drivers/media/pci/intel/ipu-isys-csi2.h
+index d7f2df3eb..3b5f13bc2 100644
+--- a/drivers/media/pci/intel/ipu-isys-csi2.h
++++ b/drivers/media/pci/intel/ipu-isys-csi2.h
+@@ -153,6 +153,7 @@ struct ipu_isys_csi2_monitor_message {
+ 					struct ipu_isys_csi2, asd)
+ 
+ int ipu_isys_csi2_get_link_freq(struct ipu_isys_csi2 *csi2, __s64 *link_freq);
++unsigned int ipu_isys_csi2_get_fw_source(struct v4l2_subdev *sd);
+ int ipu_isys_csi2_init(struct ipu_isys_csi2 *csi2,
+ 		       struct ipu_isys *isys,
+ 		       void __iomem *base, unsigned int index);
+diff --git a/drivers/media/pci/intel/ipu-isys-queue.c b/drivers/media/pci/intel/ipu-isys-queue.c
+index ee735487b..edc752f03 100644
+--- a/drivers/media/pci/intel/ipu-isys-queue.c
++++ b/drivers/media/pci/intel/ipu-isys-queue.c
+@@ -2,6 +2,7 @@
+ // Copyright (C) 2013 - 2018 Intel Corporation
+ 
+ #include <linux/completion.h>
++#include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/module.h>
+ #include <linux/string.h>
+@@ -239,10 +240,22 @@ void ipu_isys_buffer_list_queue(struct ipu_isys_buffer_list *bl,
+ 			av = ipu_isys_queue_to_video(aq);
+ 			spin_lock_irqsave(&aq->lock, flags);
+ 			list_del(&ib->head);
+-			if (op_flags & IPU_ISYS_BUFFER_LIST_FL_ACTIVE)
+-				list_add(&ib->head, &aq->active);
+-			else if (op_flags & IPU_ISYS_BUFFER_LIST_FL_INCOMING)
+-				list_add_tail(&ib->head, &aq->incoming);
++			/*
++			 * A buffer completed to vb2 is owned by user space
++			 * again and must NOT stay linked on a driver list:
++			 * the next QBUF would list_add the same node a
++			 * second time and corrupt the queue (crashes the
++			 * first time a stream start fails and the app
++			 * retries, e.g. wireplumber).
++			 */
++			if (!(op_flags & IPU_ISYS_BUFFER_LIST_FL_SET_STATE)) {
++				if (op_flags & IPU_ISYS_BUFFER_LIST_FL_ACTIVE)
++					list_add(&ib->head, &aq->active);
++				else if (op_flags &
++					 IPU_ISYS_BUFFER_LIST_FL_INCOMING)
++					list_add_tail(&ib->head,
++						      &aq->incoming);
++			}
+ 			spin_unlock_irqrestore(&aq->lock, flags);
+ 
+ 			if (op_flags & IPU_ISYS_BUFFER_LIST_FL_SET_STATE)
+@@ -534,6 +547,132 @@ struct ipu_isys_request *ipu_isys_next_queued_request(struct ipu_isys_pipeline
+ }
+ 
+ /* Start streaming for real. The buffer list must be available. */
++/*
++ * Feed any buffers waiting on the incoming queues to the firmware.
++ * Same per-buffer-set flow as the tail of ipu_isys_stream_start;
++ * best effort - stops quietly when the incoming queues are empty or
++ * on any send failure.
++ */
++static void stream_capture_refeed(struct ipu_isys_pipeline *ip)
++{
++	struct ipu_isys_video *pipe_av =
++	    container_of(ip, struct ipu_isys_video, ip);
++	struct ipu_isys_buffer_list bl;
++	int rval;
++
++	do {
++		struct ipu_fw_isys_frame_buff_set_abi *buf;
++		struct isys_fw_msgs *msg;
++
++		rval = buffer_list_get(ip, &bl);
++		if (rval < 0)
++			return;
++
++		msg = ipu_get_fw_msg_buf(ip);
++		if (!msg) {
++			ipu_isys_buffer_list_queue(&bl,
++					IPU_ISYS_BUFFER_LIST_FL_INCOMING, 0);
++			return;
++		}
++
++		buf = to_frame_msg_buf(msg);
++
++		ipu_isys_buffer_list_to_ipu_fw_isys_frame_buff_set(buf, ip,
++								   &bl);
++		ipu_isys_buffer_list_queue(&bl,
++					   IPU_ISYS_BUFFER_LIST_FL_ACTIVE, 0);
++		rval = ipu_fw_isys_complex_cmd(pipe_av->isys,
++					ip->stream_handle,
++					buf, to_dma_addr(msg),
++					sizeof(*buf),
++					IPU_FW_ISYS_SEND_TYPE_STREAM_CAPTURE);
++		ipu_put_fw_mgs_buffer(pipe_av->isys, (uintptr_t) buf);
++	} while (!rval);
++}
++
++/*
++ * Verify a just-started stream actually delivers error-free frames,
++ * bouncing the external sensor's s_stream if not.
++ *
++ * On marginal links (SP7 front ov5693, 419.2 MHz x2) the D-PHY
++ * clock-lane settle/DLL lock at the sensor's LP->HS transition fails on
++ * a large fraction of stream starts, and a missed initial SOT sync is
++ * non-recoverable for the whole stream. Bouncing the sensor's s_stream
++ * re-runs the LP->HS transition and re-rolls the lock.
++ *
++ * SOF/receiver-error heuristics are ambiguous during start-up (healthy
++ * locks emit error blips, failed locks emit SOFs and STR2MMIO-flagged
++ * frames), so judge by the only unambiguous signal: error-free frames
++ * delivered by the firmware.
++ *
++ * A failed lock consumes one buffer per corrupt frame, which would
++ * starve the fw (user space cannot requeue - it is still blocked in
++ * STREAMON) and make a successful bounce unobservable. verify_active
++ * makes ipu_isys_queue_buf_ready park those buffers back on the
++ * incoming queues, and each bounce re-feeds them to the fw.
++ *
++ * Best effort by design: the stream is up and, one way or another, the
++ * buffers end up back with the firmware; on any subdev error just stop
++ * retrying and let the capture proceed with whatever the last attempt
++ * achieved.
++ */
++static void verify_stream_start(struct ipu_isys_pipeline *ip)
++{
++	struct ipu_isys_video *pipe_av =
++	    container_of(ip, struct ipu_isys_video, ip);
++	struct device *dev = &pipe_av->isys->adev->dev;
++	struct v4l2_subdev *esd;
++	unsigned int retry, done, tick;
++	int rval;
++
++	if (!ip->csi2 || !ip->external || ip->interlaced)
++		return;
++
++	esd = media_entity_to_v4l2_subdev(ip->external->entity);
++
++	atomic_set(&ip->verify_active, 1);
++
++	/*
++	 * Lock probability per attempt varies session to session (observed
++	 * ~20-70%); 30 retries keeps the miss-all chance negligible even on
++	 * bad days, and costs nothing when the lock comes early (the loop
++	 * exits on the first error-free frame).
++	 */
++	for (retry = 0; retry < 30; retry++) {
++		done = atomic_read(&ip->frames_done);
++		for (tick = 0; tick < 12; tick++) {
++			msleep(50);
++			if (atomic_read(&ip->frames_done) != done)
++				break;
++		}
++		if (atomic_read(&ip->frames_done) != done)
++			break;
++		dev_warn(dev,
++			 "no frames from %s after start; bouncing sensor (retry %u)\n",
++			 ip->external->entity->name, retry + 1);
++		v4l2_subdev_call(esd, video, s_stream, 0);
++		/* log + clear accumulated receiver errors */
++		ipu_isys_csi2_error(ip->csi2);
++		msleep(20);
++		rval = v4l2_subdev_call(esd, video, s_stream, 1);
++		if (rval) {
++			dev_err(dev,
++				"sensor bounce s_stream(1) failed for %s: %d\n",
++				ip->external->entity->name, rval);
++			break;
++		}
++		/* hand parked (corrupt-frame) buffers back to the fw */
++		stream_capture_refeed(ip);
++	}
++
++	/*
++	 * Stop parking first, then hand back any buffer parked since
++	 * the last refeed, so nothing is left stranded on incoming.
++	 */
++	atomic_set(&ip->verify_active, 0);
++	stream_capture_refeed(ip);
++}
++
+ static int ipu_isys_stream_start(struct ipu_isys_pipeline *ip,
+ 				 struct ipu_isys_buffer_list *bl, bool error)
+ {
+@@ -620,6 +759,13 @@ static int ipu_isys_stream_start(struct ipu_isys_pipeline *ip,
+ 		ipu_put_fw_mgs_buffer(pipe_av->isys, (uintptr_t) buf);
+ 	} while (!WARN_ON(rval));
+ 
++	/*
++	 * Only now, with every queued buffer handed to the firmware, can
++	 * stream health be judged (and a D-PHY relock bounce actually
++	 * result in observable frames); see the function's comment.
++	 */
++	verify_stream_start(ip);
++
+ 	return 0;
+ 
+ out_requeue:
+@@ -1123,6 +1269,22 @@ void ipu_isys_queue_buf_ready(struct ipu_isys_pipeline *ip,
+ 
+ 		if (info->error_info.error ==
+ 		    IPU_FW_ISYS_ERROR_HW_REPORTED_STR2MMIO) {
++			/*
++			 * While stream-start verification runs, a failed
++			 * D-PHY lock burns one buffer per corrupt frame;
++			 * returning them to a user space that is still
++			 * blocked in STREAMON would starve the fw within
++			 * a few frames and make relock bounces
++			 * unobservable. Park the buffer back on the
++			 * incoming queue instead - the verify loop
++			 * re-feeds it to the fw after each bounce.
++			 */
++			if (!ip->interlaced && !ib->req &&
++			    atomic_read(&ip->verify_active)) {
++				list_move(&ib->head, &aq->incoming);
++				spin_unlock_irqrestore(&aq->lock, flags);
++				return;
++			}
+ 			/*
+ 			 * Check for error message:
+ 			 * 'IPU_FW_ISYS_ERROR_HW_REPORTED_STR2MMIO'
+diff --git a/drivers/media/pci/intel/ipu-isys-subdev.c b/drivers/media/pci/intel/ipu-isys-subdev.c
+index c3094e0a9..710560005 100644
+--- a/drivers/media/pci/intel/ipu-isys-subdev.c
++++ b/drivers/media/pci/intel/ipu-isys-subdev.c
+@@ -817,7 +817,12 @@ int ipu_isys_subdev_link_validate(struct v4l2_subdev *sd,
+ 		 * sub-device.
+ 		 */
+ 		ip->external = link->source;
+-		ip->source = to_ipu_isys_subdev(sd)->source;
++		if (!strncmp(sd->entity.name,
++			     IPU_ISYS_ENTITY_PREFIX " CSI-2 ",
++			     strlen(IPU_ISYS_ENTITY_PREFIX " CSI-2 ")))
++			ip->source = ipu_isys_csi2_get_fw_source(sd);
++		else
++			ip->source = to_ipu_isys_subdev(sd)->source;
+ 		dev_dbg(&asd->isys->adev->dev, "%s: using source %d\n",
+ 			sd->entity.name, ip->source);
+ 	} else if (source_sd->entity.num_pads == 1) {
+diff --git a/drivers/media/pci/intel/ipu-isys-video.c b/drivers/media/pci/intel/ipu-isys-video.c
+index 51a8a8029..484090dc8 100644
+--- a/drivers/media/pci/intel/ipu-isys-video.c
++++ b/drivers/media/pci/intel/ipu-isys-video.c
+@@ -38,6 +38,11 @@ static bool use_stream_stop;
+ module_param(use_stream_stop, bool, 0660);
+ MODULE_PARM_DESC(use_stream_stop, "Use STOP command if running in CSI capture mode");
+ 
++static bool debug_capture_links;
++module_param(debug_capture_links, bool, 0444);
++MODULE_PARM_DESC(debug_capture_links,
++		 "Also link the debug capture nodes (per-CSI-2 MIPI packet dumps, CSI2 BE/ISA) into the media graph; their output is not a clean raster (default 0)");
++
+ static void ipu_isys_log_csi2_state(struct device *dev,
+ 				    struct ipu_isys_pipeline *ip,
+ 				    const char *tag)
+@@ -717,6 +722,7 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *fh,
+ 	av->mpix = mpix;
+ 
+ 	fmt_mp_to_sp(&f->fmt.pix, &mpix);
++	av->pix_fmt = f->fmt.pix;
+ 
+ 	return 0;
+ }
+@@ -779,11 +785,40 @@ static int vidioc_s_input(struct file *file, void *fh, unsigned int input)
+ 	return input == 0 ? 0 : -EINVAL;
+ }
+ 
++/*
++ * Return true if an entity directly connected to an Iunit entity is
++ * an image source for the ISP. This can be any external directly
++ * connected entity or any of the test pattern generators in the
++ * Iunit.
++ */
++static bool is_external(struct ipu_isys_video *av, struct media_entity *entity)
++{
++	struct v4l2_subdev *sd;
++	unsigned int i;
++
++	/* All video nodes are ours. */
++	if (!is_media_entity_v4l2_subdev(entity))
++		return false;
++
++	sd = media_entity_to_v4l2_subdev(entity);
++	if (strncmp(sd->name, IPU_ISYS_ENTITY_PREFIX,
++		strlen(IPU_ISYS_ENTITY_PREFIX)) != 0)
++		return true;
++
++	for (i = 0; i < av->isys->pdata->ipdata->tpg.ntpgs &&
++	     av->isys->tpg[i].isys; i++)
++		if (entity == &av->isys->tpg[i].asd.sd.entity)
++			return true;
++
++	return false;
++}
++
+ static int link_validate(struct media_link *link)
+ {
+ 	struct ipu_isys_video *av =
+ 		container_of(link->sink, struct ipu_isys_video, pad);
+ 	struct device *dev = &av->isys->adev->dev;
++	struct media_pipeline *mp;
+ 	struct v4l2_subdev_state *s_state;
+ 	struct v4l2_subdev *s_sd;
+ 	struct v4l2_mbus_framefmt *s_fmt;
+@@ -800,6 +835,27 @@ static int link_validate(struct media_link *link)
+ 		link->source->entity->name, link->source->index,
+ 		link->sink->entity->name);
+ 
++	/*
++	 * If the source feeding this video node is an external entity
++	 * or an Iunit TPG, it is the pipeline's frame source: record
++	 * it so prepare_streaming can configure the ISYS fw stream.
++	 * (For sensor pipelines the CSI-2 subdev's link_validate does
++	 * this; a TPG connects straight to its capture node, so this
++	 * is the only link validation that sees it.)
++	 */
++	mp = media_entity_pipeline(&av->vdev.entity);
++	if (mp && is_external(av, link->source->entity)) {
++		struct ipu_isys_pipeline *ip = to_ipu_isys_pipeline(mp);
++
++		if (!ip->external) {
++			ip->external =
++				media_pad_remote_pad_first(av->vdev.entity.pads);
++			ip->source = to_ipu_isys_subdev(s_sd)->source;
++			dev_dbg(dev, "%s: using source %d\n",
++				av->vdev.entity.name, ip->source);
++		}
++	}
++
+ 	s_pad = media_pad_remote_pad_first(&av->pad);
+ 	s_stream = ipu_isys_get_src_stream_by_src_pad(s_sd, s_pad->index);
+ 
+@@ -1062,8 +1118,15 @@ static bool is_support_vc(struct media_pad *source_pad,
+ 	struct v4l2_query_ext_ctrl qm_ctrl = {
+ 		.id = V4L2_CID_IPU_QUERY_SUB_STREAM, };
+ 	int i;
++	/*
++	 * Walking pads[0] upstream can ping-pong between a video node and
++	 * a subdev that never matches (e.g. TPG <-> TPG capture), so bound
++	 * the walk to keep pipelines without a CSI-2 entity from spinning.
++	 */
++	int depth = MEDIA_ENTITY_ENUM_MAX_DEPTH;
+ 
+-	while ((remote_pad =
++	while (depth-- > 0 &&
++	       (remote_pad =
+ 		media_pad_remote_pad_first(&remote_pad->entity->pads[0])
+ 		)) {
+ 		/* Non-subdev nodes can be safely ignored here. */
+@@ -1118,8 +1181,10 @@ static int ipu_isys_query_sensor_info(struct media_pad *source_pad,
+ 	struct media_pad *extern_pad = NULL;
+ 	struct v4l2_subdev *sd = NULL;
+ 	struct v4l2_querymenu qm = {.id = V4L2_CID_IPU_QUERY_SUB_STREAM, };
++	int depth = MEDIA_ENTITY_ENUM_MAX_DEPTH;
+ 
+-	while ((remote_pad =
++	while (depth-- > 0 &&
++	       (remote_pad =
+ 		media_pad_remote_pad_first(&remote_pad->entity->pads[0])
+ 		)) {
+ 		/* Non-subdev nodes can be safely ignored here. */
+@@ -1926,6 +1991,7 @@ int ipu_isys_video_prepare_streaming(struct ipu_isys_video *av,
+ 	ip->nr_queues = 0;
+ 	ip->external = NULL;
+ 	atomic_set(&ip->sequence, 0);
++	atomic_set(&ip->frames_done, 0);
+ 	ip->isl_mode = IPU_ISL_OFF;
+ 
+ 	for (i = 0; i < IPU_NUM_CAPTURE_DONE; i++)
+@@ -1988,7 +2054,14 @@ int ipu_isys_video_prepare_streaming(struct ipu_isys_video *av,
+ 	return 0;
+ 
+ out_pipeline_stop:
+-	media_pipeline_stop(av->vdev.entity.pads);
++	/*
++	 * The pipeline was started by media_pipeline_start_by_vc(),
++	 * which does not populate pipe->pads; the upstream
++	 * media_pipeline_stop() would walk that uninitialized list and
++	 * oops. Use the matching VC-aware teardown instead.
++	 */
++	media_pipeline_stop_for_vc(av);
++	av->vdev.entity.pads[0].pipe = NULL;
+ 
+ out_enum_cleanup:
+ 	media_entity_enum_cleanup(&ip->entity_enum);
+@@ -2170,6 +2243,7 @@ int ipu_isys_video_set_streaming(struct ipu_isys_video *av,
+ 		ipu_isys_log_csi2_state(dev, ip, "post ext s_stream state");
+ 		if (rval)
+ 			goto out_media_entity_stop_streaming_firmware;
++
+ 	} else {
+ 		close_streaming_firmware(av);
+ 		av->ip.stream_id = 0;
+@@ -2373,12 +2447,16 @@ int ipu_isys_video_init(struct ipu_isys_video *av,
+ 	if (rval)
+ 		goto out_media_entity_cleanup;
+ 
+-	if (pad_flags & MEDIA_PAD_FL_SINK)
++	if (av->debug_link_only && !debug_capture_links) {
++		/* Debug tap: leave unlinked, see ipu_isys_video::debug_link_only */
++		rval = 0;
++	} else if (pad_flags & MEDIA_PAD_FL_SINK) {
+ 		rval = media_create_pad_link(entity, pad,
+ 					     &av->vdev.entity, 0, flags);
+-	else
++	} else {
+ 		rval = media_create_pad_link(&av->vdev.entity, 0, entity,
+ 					     pad, flags);
++	}
+ 	if (rval) {
+ 		dev_info(&av->isys->adev->dev, "can't create link\n");
+ 		goto out_media_entity_cleanup;
+diff --git a/drivers/media/pci/intel/ipu-isys-video.h b/drivers/media/pci/intel/ipu-isys-video.h
+index 4f3f4415b..cb3eee797 100644
+--- a/drivers/media/pci/intel/ipu-isys-video.h
++++ b/drivers/media/pci/intel/ipu-isys-video.h
+@@ -68,6 +68,15 @@ struct ipu_isys_pipeline {
+ 	struct media_pipeline pipe;
+ 	struct media_pad *external;
+ 	atomic_t sequence;
++	/* frames actually delivered by fw (PIN_DATA_READY responses) */
++	atomic_t frames_done;
++	/*
++	 * Stream-start verification in progress: STR2MMIO-errored
++	 * buffers are parked back on the incoming queue for re-feeding
++	 * to the fw instead of being returned to user space, so the
++	 * fw never starves while the D-PHY relock bounces run.
++	 */
++	atomic_t verify_active;
+ 	int last_sequence;
+ 	unsigned int seq_index;
+ 	struct sequence_info seq[IPU_ISYS_MAX_PARALLEL_SOF];
+@@ -152,6 +161,18 @@ struct ipu_isys_video {
+ 	struct ipu_isys_stream *stream;
+ 	unsigned int streaming;
+ 	bool packed;
++	/*
++	 * Debug tap: register the video node but do not link it into the
++	 * media graph unless the isys module is loaded with
++	 * debug_capture_links=1. Set for the per-CSI-2 direct capture and
++	 * meta nodes (str2mmio MIPI packet dumps: the DMA accumulates
++	 * received payload bytes, so every PHY line glitch shears the rest
++	 * of the frame) and the CSI2 BE (ISA/ISL) capture (the dual-line
++	 * fabric interleaves the output beyond use). Keeping the nodes
++	 * unlinked steers libcamera's media-graph walk to the CSI2 BE SOC
++	 * path, the only route that produces clean raster frames.
++	 */
++	bool debug_link_only;
+ 	unsigned int line_header_length;	/* bits */
+ 	unsigned int line_footer_length;	/* bits */
+ 	struct video_stream_watermark watermark;
+diff --git a/drivers/media/pci/intel/ipu-isys.c b/drivers/media/pci/intel/ipu-isys.c
+index d781a4d91..b36fc001f 100644
+--- a/drivers/media/pci/intel/ipu-isys.c
++++ b/drivers/media/pci/intel/ipu-isys.c
+@@ -1165,6 +1165,16 @@ int isys_isr_one(struct ipu_bus_device *adev)
+ 		complete(&pipe->stream_stop_completion);
+ 		break;
+ 	case IPU_FW_ISYS_RESP_TYPE_PIN_DATA_READY:
++		/*
++		 * On a failed D-PHY lock the fw still delivers PIN_DATA_READY
++		 * for every (corrupt) frame, but with
++		 * IPU_FW_ISYS_ERROR_HW_REPORTED_STR2MMIO set; those buffers
++		 * reach user space only in the error state. Count only clean
++		 * deliveries so the stream-start health check can't mistake
++		 * an error storm for working capture.
++		 */
++		if (!resp->error_info.error)
++			atomic_inc(&pipe->frames_done);
+ 		if (resp->pin_id < IPU_ISYS_OUTPUT_PINS &&
+ 		    pipe->output_pins[resp->pin_id].pin_ready)
+ 			pipe->output_pins[resp->pin_id].pin_ready(pipe, resp);
+diff --git a/drivers/media/pci/intel/ipu4/ipu4-isys.c b/drivers/media/pci/intel/ipu4/ipu4-isys.c
+index 514eade03..221cf10a5 100644
+--- a/drivers/media/pci/intel/ipu4/ipu4-isys.c
++++ b/drivers/media/pci/intel/ipu4/ipu4-isys.c
+@@ -144,35 +144,120 @@ static void ipu4p_isys_irq_cfg(struct ipu_isys *isys)
+ 	writel(0, base + IPU_REG_ISYS_UNISPART_SW_IRQ_MUX_REG);
+ }
+ 
++/*
++ * The builtin bbconfig below configures the PHY building blocks for
++ * bbs 4/6 and 12/14 only. On Surface Pro 7 the front ov5693 (sip1
++ * port 1, x2) appears to sit on bbs that are not in the list, so its
++ * analog front end never gets configured and the receiver sees no HS
++ * traffic. Allow extra bbs to be configured at runtime; consulted on
++ * every isys resume (i.e. after each power island cycle), e.g.:
++ *   echo 8,10 > /sys/module/intel_ipu4p_isys/parameters/phy_bb_extra
++ * then cycle the island and retry the capture.
++ */
++static int phy_bb_extra[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
++module_param_array(phy_bb_extra, int, NULL, 0644);
++MODULE_PARM_DESC(phy_bb_extra,
++		 "Extra PHY building blocks to configure (-1 = none)");
++
++static int phy_afe_extra[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
++module_param_array(phy_afe_extra, int, NULL, 0644);
++MODULE_PARM_DESC(phy_afe_extra,
++		 "AFE config value per extra bb (-1 = alternate 0xf/0x15)");
++
++static bool phy_jsl_bits;
++module_param(phy_jsl_bits, bool, 0644);
++MODULE_PARM_DESC(phy_jsl_bits,
++		 "Also set JSL-style CPHY_RX_CONTROL1/DPHY_CFG bits on all bbs");
++
++static void ipu4p_isys_bb_cfg_one(struct ipu_isys *isys, unsigned int bb,
++				  unsigned int crc, unsigned int drc,
++				  unsigned int afe)
++{
++	void __iomem *isp_base = isys->adev->isp->base;
++	u32 val;
++
++	val = readl(isp_base + BUTTRESS_REG_CPHYX_DLL_OVRD(bb));
++	val &= ~0x7e;
++	val |= crc << 1;
++	val |= 1;
++	writel(val, isp_base + BUTTRESS_REG_CPHYX_DLL_OVRD(bb));
++	val = readl(isp_base + BUTTRESS_REG_DPHYX_DLL_OVRD(bb));
++	val |= 1;
++	val |= drc << 1;
++	writel(val, isp_base + BUTTRESS_REG_DPHYX_DLL_OVRD(bb));
++	val = afe | (2 << 29);
++	writel(val, isp_base + BUTTRESS_REG_BBX_AFE_CONFIG(bb));
++}
++
+ static void ipu4p_isys_bb_cfg(struct ipu_isys *isys)
+ {
+ 	void __iomem *isp_base = isys->adev->isp->base;
+ 	unsigned int i, val;
+-	unsigned int bbconfig[4][4] = {
++	unsigned int bbconfig[5][4] = {
+ 		{4, 13, 32, 0xf},
+ 		{6, 13, 32, 0x15},
+ 		{12, 13, 32, 0xf},
+ 		{14, 13, 32, 0x15},
++		/*
++		 * Surface Pro 7: the front ov5693 (sip1, x2) sits on
++		 * building block 10, which the original list left
++		 * unconfigured — its AFE never powered up and the
++		 * receiver saw no HS traffic. AFE 0x15 matches the JSL
++		 * x2 value; verified stable (0 sync errors). Do NOT
++		 * configure bb 8 the same way: it injects DPHY sync
++		 * errors on bb 10 (bb 8 is likely the ov7251 IR lane).
++		 */
++		{10, 13, 32, 0x15},
+ 	};
+ 
+ 	/* Config building block */
+-	for (i = 0; i < 4; i++) {
+-		unsigned int bb = bbconfig[i][0];
+-		unsigned int crc = bbconfig[i][1];
+-		unsigned int drc = bbconfig[i][2];
+-		unsigned int afe = bbconfig[i][3];
++	for (i = 0; i < ARRAY_SIZE(bbconfig); i++)
++		ipu4p_isys_bb_cfg_one(isys, bbconfig[i][0], bbconfig[i][1],
++				      bbconfig[i][2], bbconfig[i][3]);
+ 
+-		val = readl(isp_base + BUTTRESS_REG_CPHYX_DLL_OVRD(bb));
+-		val &= ~0x7e;
+-		val |= crc << 1;
+-		val |= 1;
+-		writel(val, isp_base + BUTTRESS_REG_CPHYX_DLL_OVRD(bb));
+-		val = readl(isp_base + BUTTRESS_REG_DPHYX_DLL_OVRD(bb));
+-		val |= 1;
+-		val |= drc << 1;
+-		writel(val, isp_base + BUTTRESS_REG_DPHYX_DLL_OVRD(bb));
+-		val = afe | (2 << 29);
+-		writel(val, isp_base + BUTTRESS_REG_BBX_AFE_CONFIG(bb));
++	for (i = 0; i < ARRAY_SIZE(phy_bb_extra); i++) {
++		int bb = phy_bb_extra[i];
++		unsigned int afe;
++
++		if (bb < 0)
++			continue;
++		afe = phy_afe_extra[i] >= 0 ? phy_afe_extra[i] :
++			((i & 1) ? 0x15 : 0xf);
++		dev_info(&isys->adev->dev,
++			 "phy: extra bb %d cfg, afe 0x%x\n", bb, afe);
++		ipu4p_isys_bb_cfg_one(isys, bb, 13, 32, afe);
++	}
++
++	if (phy_jsl_bits) {
++		dev_info(&isys->adev->dev, "phy: applying JSL-style bits\n");
++		for (i = 0; i < 16; i += 2) {
++			val = readl(isp_base +
++				    BUTTRESS_REG_CPHYX_RX_CONTROL1(i));
++			val |= BIT(31);
++			writel(val, isp_base +
++			       BUTTRESS_REG_CPHYX_RX_CONTROL1(i));
++			/*
++			 * DPHY_CFG is 4 bytes below DPHY_DLL_OVRD (0x148 vs
++			 * 0x14c); no dedicated macro exists in the header.
++			 */
++			val = readl(isp_base +
++				    BUTTRESS_REG_DPHYX_DLL_OVRD(i) - 4);
++			val |= BIT(25) | BIT(26);
++			writel(val, isp_base +
++			       BUTTRESS_REG_DPHYX_DLL_OVRD(i) - 4);
++		}
++	}
++
++	/* Log full PHY bb state to aid bring-up diagnosis */
++	for (i = 0; i < 16; i += 2) {
++		dev_dbg(&isys->adev->dev,
++			"phy bb %u: cphy_dll=0x%x rx_ctrl1=0x%x dphy_cfg=0x%x dphy_dll=0x%x afe=0x%x\n",
++			i,
++			readl(isp_base + BUTTRESS_REG_CPHYX_DLL_OVRD(i)),
++			readl(isp_base + BUTTRESS_REG_CPHYX_RX_CONTROL1(i)),
++			readl(isp_base + BUTTRESS_REG_DPHYX_DLL_OVRD(i) - 4),
++			readl(isp_base + BUTTRESS_REG_DPHYX_DLL_OVRD(i)),
++			readl(isp_base + BUTTRESS_REG_BBX_AFE_CONFIG(i)));
+ 	}
+ }
+ 

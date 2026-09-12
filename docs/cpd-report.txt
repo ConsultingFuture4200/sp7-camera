@@ -1,0 +1,61 @@
+file   : camera-pkgs/iacamera64.inf_amd64_88452739904c935a/cpd_component_signed.bin
+size   : 3960832 bytes
+sha256 : ff2c36cc81a5c726508b22970c2e2538ff06107dc5a72c93401403c227e5157f
+
+== outer CPD header ==
+  hdr_mark : 0x44504324 ($CPD)
+  ent_cnt  : 3    hdr_ver: 1  ent_ver: 1  hdr_len: 0x10  [CSE 1.6 (IPU6SE/IPU4)]
+
+== outer CPD entries ==
+  idx  name             offset     length  role
+    0  IUNM.man             88        836  MANIFEST
+    1  iunit.met           960        776  METADATA
+    2  iunit              1792    3956736  MODULEDATA
+
+== metadata ==
+  extn_type : 0x10 (IUNIT)
+  img_type  : 2 (MAIN_FIRMWARE)
+  payload   : 748 bytes -> 11 x 68-byte components  [IPU6SE / IPU4 (32-byte hash)]
+
+== moduledata header ==
+  hdr_len         : 0x2c
+  endian          : 0x2
+  fw_pkg_date     : 0x20191030
+  hive_sdk_date   : 0x20171010
+  compiler_date   : 0x20171008
+  target_platform : 0x3
+  sys_ver         : 'cnlB0_IPU4'
+  fw_arch_ver     : 'CSS3.0'
+
+== inner CPD (moduledata @ 1836) ==
+  hdr_mark : 0x00000000 (kernel does not check the inner marker)
+  ent_cnt  : 11    hdr_len: 0x10
+
+== firmware components ==
+  idx   type role (by index)    rel.off     length   entry_pt     icache  sha256[:16]
+    0      1 PSYS_SERVER           4096     229376 0x00000000 0x00001000  889d750ee3c0ad84
+    1      2 ISYS_SERVER         233472     172032 0x00000ab9 0x00001000  0fa1f14b6ccb6ed1
+    2      3 client PG           405504     217088 0x00000000 0x00000000  b765d446bf8c17f0
+    3      4 client PG           622592     323584 0x00000000 0x00000000  fb14202efed8da4b
+    4      5 client PG           946176     491520 0x00000000 0x00000000  1924fe0b7f13fcef
+    5      6 client PG          1437696     208896 0x00000000 0x00000000  b082f0b586b8c093
+    6      7 client PG          1646592     397312 0x00000000 0x00000000  1a7d4fdc47bc83be
+    7      8 client PG          2043904     520192 0x00000000 0x00000000  05d00d69d585d253
+    8      9 client PG          2564096     593920 0x00000000 0x00000000  0c04bf3497ce7760
+    9     10 client PG          3158016     593920 0x00000000 0x00000000  174748e130adff7e
+   10     11 client PG          3751936     204800 0x00000000 0x00000000  04ee1e2e228c9ed8
+
+  [PASS] metadata component count == inner CPD entry count  11
+  [PASS] component sizes agree between metadata and inner CPD
+
+== ipu6_cpd_validate_cpd_file ==
+  [PASS] hdr_mark == $CPD
+  [PASS] all outer entries within file
+  [PASS] manifest <= MAX_MANIFEST_SIZE  836 <= 8192
+  [PASS] metadata size within bounds  776
+  [PASS] extn_type == IUNIT
+  [PASS] img_type == MAIN_FIRMWARE
+  [PASS] metadata size multiple of cpd_metadata_cmpnt_size  cmpnt_size=68
+  [PASS] all inner entries within moduledata
+
+== RESULT: VALIDATES ==

@@ -1,0 +1,155 @@
+From b061f8daddd3f3955df0f5722330baf6ce031432 Mon Sep 17 00:00:00 2001
+From: sp7 <sp7@local>
+Date: Sat, 12 Sep 2026 02:03:39 -0700
+Subject: [PATCH] media: intel/ipu4: fix probe GP-fault and restore
+ enum_framesizes on the BE SOC node
+
+Two crashes/blockers found bringing the thisiscamk/sp7-ipu4-camera tree up on a
+second Surface Pro 7 (vanilla 6.19.8 + ruslanbay/ipu4-drivers v6.19 series).
+
+1) General protection fault during isys probe.
+
+   Fix 12 ("unlink debug capture nodes") makes ipu_isys_video_init() skip link
+   creation for debug_link_only nodes, but it still calls
+   av->try_fmt_vid_mplane() unconditionally afterwards. For CSI-2 taps that is
+   csi2_try_fmt(), which begins:
+
+       struct media_link *link = list_first_entry(&av->vdev.entity.links,
+                                                  struct media_link, list);
+       struct v4l2_subdev *sd =
+               media_entity_to_v4l2_subdev(link->source->entity);
+
+   list_first_entry() on an *empty* list yields container_of(head), not NULL, so
+   link is a wild pointer and csi2->store_csi2_header is garbage by the time
+   v4l2_ctrl_g_ctrl() dereferences it:
+
+       Oops: general protection fault, probably for non-canonical address
+             0x6c8b4c30247c8b80
+       RIP: v4l2_ctrl_g_ctrl+0x36/0x80 [videodev]
+        csi2_try_fmt+0x35/0x50 [intel_ipu4p_isys]
+        ipu_isys_video_init+0x304/0x370 [intel_ipu4p_isys]
+        ipu_isys_csi2_init.cold+0x2f7/0x407 [intel_ipu4p_isys]
+        isys_probe.cold+0x1b8/0x8d4 [intel_ipu4p_isys]
+
+   Probe dies on CSI-2 port 0 and only one video node is created.
+   ipu_isys_tpg_try_fmt() carries the same pattern.
+
+   Return early from ipu_isys_video_init() for an unlinked debug tap (it has no
+   remote subdev and cannot capture), and guard both try_fmt implementations
+   with list_empty().
+
+2) VIDIOC_ENUM_FRAMESIZES returned ENOTTY on the CSI2 BE SOC capture node.
+
+   ipu_isys_video_init() picks ioctl_ops_mplane when av->line_header_length is
+   set and ioctl_ops_splane otherwise. The BE SOC node has no line header, so it
+   gets the single-planar struct -- which lacked .vidioc_enum_framesizes, so the
+   v4l2 core rejected the ioctl before reaching the driver. That node is the only
+   route producing clean line-addressed raster, i.e. the one applications must
+   use, so libcamera's simple pipeline handler failed configuration with:
+
+       /dev/videoN[16:cap]: Unable to enumerate frame sizes: Inappropriate ioctl
+       SimplePipeline simple.cpp:653 No valid configuration found
+
+   Add .vidioc_enum_framesizes to ioctl_ops_splane.
+
+With both fixes isys probes cleanly (55 video nodes), raw capture works on both
+SP7 sensors, and libcamera enumerates and streams the cameras.
+---
+ drivers/media/pci/intel/ipu-isys-csi2.c  | 18 ++++++++++++++----
+ drivers/media/pci/intel/ipu-isys-tpg.c   | 14 ++++++++++----
+ drivers/media/pci/intel/ipu-isys-video.c | 17 +++++++++++++++++
+ 3 files changed, 41 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/media/pci/intel/ipu-isys-csi2.c b/drivers/media/pci/intel/ipu-isys-csi2.c
+index a387d019c..de4141f87 100644
+--- a/drivers/media/pci/intel/ipu-isys-csi2.c
++++ b/drivers/media/pci/intel/ipu-isys-csi2.c
+@@ -675,12 +675,22 @@ static const struct ipu_isys_pixelformat *
+ csi2_try_fmt(struct ipu_isys_video *av,
+ 	     struct v4l2_pix_format_mplane *mpix)
+ {
+-	struct media_link *link = list_first_entry(&av->vdev.entity.links,
+-						   struct media_link, list);
+-	struct v4l2_subdev *sd =
+-	    media_entity_to_v4l2_subdev(link->source->entity);
++	struct media_link *link;
++	struct v4l2_subdev *sd;
+ 	struct ipu_isys_csi2 *csi2;
+ 
++	/*
++	 * An unlinked debug tap has no entity links; list_first_entry() on an
++	 * empty list yields container_of(head), i.e. a wild pointer, and the
++	 * v4l2_ctrl_g_ctrl() below then faults on it.
++	 */
++	if (list_empty(&av->vdev.entity.links))
++		return NULL;
++
++	link = list_first_entry(&av->vdev.entity.links,
++				struct media_link, list);
++	sd = media_entity_to_v4l2_subdev(link->source->entity);
++
+ 	if (!sd)
+ 		return NULL;
+ 
+diff --git a/drivers/media/pci/intel/ipu-isys-tpg.c b/drivers/media/pci/intel/ipu-isys-tpg.c
+index 10aeec19d..358a5f628 100644
+--- a/drivers/media/pci/intel/ipu-isys-tpg.c
++++ b/drivers/media/pci/intel/ipu-isys-tpg.c
+@@ -201,12 +201,18 @@ static const struct ipu_isys_pixelformat *ipu_isys_tpg_try_fmt(
+ 					struct ipu_isys_video *av,
+ 					struct v4l2_pix_format_mplane *mpix)
+ {
+-	struct media_link *link = list_first_entry(&av->vdev.entity.links,
+-						   struct media_link, list);
+-	struct v4l2_subdev *sd =
+-		media_entity_to_v4l2_subdev(link->source->entity);
++	struct media_link *link;
++	struct v4l2_subdev *sd;
+ 	struct ipu_isys_tpg *tpg;
+ 
++	/* See csi2_try_fmt(): guard against an empty entity link list. */
++	if (list_empty(&av->vdev.entity.links))
++		return NULL;
++
++	link = list_first_entry(&av->vdev.entity.links,
++				struct media_link, list);
++	sd = media_entity_to_v4l2_subdev(link->source->entity);
++
+ 	if (!sd)
+ 		return NULL;
+ 
+diff --git a/drivers/media/pci/intel/ipu-isys-video.c b/drivers/media/pci/intel/ipu-isys-video.c
+index 484090dc8..1f8b6be64 100644
+--- a/drivers/media/pci/intel/ipu-isys-video.c
++++ b/drivers/media/pci/intel/ipu-isys-video.c
+@@ -2307,6 +2307,14 @@ static long ipu_isys_compat_ioctl(struct file *file, unsigned int cmd,
+ static const struct v4l2_ioctl_ops ioctl_ops_splane = {
+ 	.vidioc_querycap = ipu_isys_vidioc_querycap,
+ 	.vidioc_enum_fmt_vid_cap = ipu_isys_vidioc_enum_fmt,
++	/*
++	 * The CSI2 BE SOC capture node has no line_header_length, so it gets
++	 * this single-planar ops struct -- and it is the only route that
++	 * produces a clean raster, i.e. the one libcamera must use. Without
++	 * enum_framesizes here the core returns ENOTTY and the simple pipeline
++	 * handler gives up with "No valid configuration found".
++	 */
++	.vidioc_enum_framesizes = ipu_isys_vidioc_enum_framesizes,
+ 	.vidioc_g_fmt_vid_cap = vidioc_g_fmt_vid_cap,
+ 	.vidioc_s_fmt_vid_cap = vidioc_s_fmt_vid_cap,
+ 	.vidioc_try_fmt_vid_cap = vidioc_try_fmt_vid_cap,
+@@ -2450,6 +2458,15 @@ int ipu_isys_video_init(struct ipu_isys_video *av,
+ 	if (av->debug_link_only && !debug_capture_links) {
+ 		/* Debug tap: leave unlinked, see ipu_isys_video::debug_link_only */
+ 		rval = 0;
++		/*
++		 * With no link created, the node has no remote subdev, and the
++		 * ->try_fmt_vid_mplane() implementations below walk
++		 * entity.links with list_first_entry() -- which on an empty
++		 * list yields container_of(head), i.e. a wild pointer. Skip
++		 * the format probe entirely; an unlinked tap cannot capture.
++		 */
++		mutex_unlock(&av->mutex);
++		return 0;
+ 	} else if (pad_flags & MEDIA_PAD_FL_SINK) {
+ 		rval = media_create_pad_link(entity, pad,
+ 					     &av->vdev.entity, 0, flags);

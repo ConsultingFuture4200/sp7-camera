@@ -5,3 +5,9 @@ camera-pkgs/
 # decoded/ is derived from those files; kept local by default (see README)
 decoded/
 __pycache__/
+# captures and build artefacts
+*.raw
+*.ko
+*.ko.zst
+*.pkg.tar.zst
+caps/
