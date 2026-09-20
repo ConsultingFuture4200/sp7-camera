@@ -1,0 +1,14 @@
+[Unit]
+Description=Surface Pro 7 rear camera on demand (v4l2loopback /dev/video60)
+Documentation=file://%h/Projects/sp7-camera/tools/sp7-camera-relay.py
+After=wireplumber.service
+
+[Service]
+# Idles cheaply until /dev/video60 exists (sudo ~/loadcam), then keeps the
+# loopback valid and runs the camera only while an app streams from it.
+ExecStart=/usr/bin/python3 %h/Projects/sp7-camera/tools/sp7-camera-relay.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

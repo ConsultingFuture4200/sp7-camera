@@ -11,11 +11,20 @@ OUT=/home/bobmob/Projects/sp7-camera/caps/$CAM.raw
 TCK=/home/bobmob/Projects/sp7-camera/build/tck
 
 echo "=== configuring pipeline: $CAM ($SENSOR -> CSI-2 $PORT -> BE SOC) ==="
-media-ctl -d /dev/media0 -r
+# No global `media-ctl -r`: after a failed stream the driver can leave an
+# entity flagged as streaming, and then resetting ANY link returns EBUSY even
+# with nothing open. Touch only what this capture needs instead.
+if [ "$CAM" = front ]; then OTHER=0; else OTHER=2; fi
+# the other port's route into BE SOC:0 must be off (two sources on one pad is invalid);
+# BE SOC links are DYNAMIC so this is allowed even in the stuck state
+python3 "$TCK/enable-link.py" "Intel IPU4 CSI-2 $OTHER:1" "Intel IPU4 CSI2 BE SOC:0" 0x4 >/dev/null 2>&1 || true
 media-ctl -d /dev/media0 -V "\"$SENSOR\":0 [fmt:$FMT/$RES]"
 media-ctl -d /dev/media0 -V "\"Intel IPU4 CSI-2 $PORT\":0 [fmt:$FMT/$RES]"
 media-ctl -d /dev/media0 -V "\"Intel IPU4 CSI-2 $PORT\":1 [fmt:$FMT/$RES]"
-media-ctl -d /dev/media0 -l "\"$SENSOR\":0 -> \"Intel IPU4 CSI-2 $PORT\":0 [1]"
+# sensor -> CSI-2 is a normal link: only set it if it is not already enabled
+if ! media-ctl -d /dev/media0 -p 2>/dev/null | grep -A40 "entity.*\"\?$SENSOR" | grep -qE "CSI-2 $PORT\":0 \[ENABLED"; then
+  media-ctl -d /dev/media0 -l "\"$SENSOR\":0 -> \"Intel IPU4 CSI-2 $PORT\":0 [1]"
+fi
 python3 "$TCK/enable-link.py" "Intel IPU4 CSI-2 $PORT:1" "Intel IPU4 CSI2 BE SOC:0"
 python3 "$TCK/enable-link.py" "Intel IPU4 CSI2 BE SOC:8" "Intel IPU4 BE SOC capture 0:0"
 media-ctl -d /dev/media0 -V "\"Intel IPU4 CSI2 BE SOC\":0 [fmt:$FMT/$RES]"

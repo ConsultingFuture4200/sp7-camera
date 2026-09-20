@@ -2,6 +2,11 @@
 # Step 9 — load the IPU4P stack in the required order. RUN AS ROOT, ONCE PER BOOT.
 # Reload does not work (the CSE/firmware handshake wedges), so a failure here
 # means reboot before retrying. Adapted from thisiscamk/sp7-ipu4-camera load-ipu4.sh.
+if [[ $(uname -r) != 6.19.8-arch1-1-ipu4p ]]; then
+  echo "ABORT: running $(uname -r); need the linux-ipu4p kernel. Reboot and pick linux-ipu4p in the Limine menu." >&2
+  exit 2
+fi
+
 LOG=/home/bobmob/Projects/sp7-camera/load-$(date +%H%M%S).log
 exec > >(tee "$LOG") 2>&1
 echo "=== $(date -Is)  kernel $(uname -r) ==="
@@ -21,6 +26,7 @@ for i in $(seq 1 50); do [ -e "$MMU1" ] && break; sleep 0.1; done
 if [ -e "$MMU1" ]; then echo on > "$MMU1" && echo "--- pinned mmu1 ON"; else echo "*** WARN: $MMU1 absent"; fi
 
 step intel_ipu4p_isys
+modprobe v4l2loopback && echo "--- modprobe v4l2loopback (/dev/video60)"
 sleep 3
 
 echo; echo "=== dmesg (camera-relevant) ==="

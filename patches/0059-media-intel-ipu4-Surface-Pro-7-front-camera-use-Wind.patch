@@ -1,0 +1,114 @@
+From d90b890c32c8f2a2eac2e7951d8158d1a4708713 Mon Sep 17 00:00:00 2001
+From: sp7 <sp7@local>
+Date: Sun, 20 Sep 2026 13:00:09 -0700
+Subject: [PATCH] media: intel/ipu4: Surface Pro 7 front camera: use Windows'
+ fixed CSI-2 receiver timing
+
+The front ov5693 (CSI-2 index 2 = firmware source 7, two lanes) locks
+D-PHY sync only ~1/6 of cold starts with the driver's calculated settle
+counts, even with the best overrides found by sweeping (dsettle=1000,
+csettle=1800).  georgemihaila/sp7-ipu4-camera traced Windows'
+ConfigMipiClk for this receiver and found it programs fixed values into
+the receiver delay registers instead: 0 -> 0x30, 1155 -> 0x34, then
+0 -> 0x38+8i and 1269 -> 0x3c+8i for i = 0..7, and writes the lane count
+before RX_CONFIG.
+
+Do the same, scoped to exactly that receiver / source / lane count so
+the rear ov8865 and the ov7251 path are untouched, behind a runtime
+module parameter (sp7_front_timing_quirk, default on) so it can be A/B
+tested without a rebuild.
+
+Result on a second SP7 (1866), 6 cold starts each through libcamera:
+  quirk on                 6/6 locked, 0 sensor bounces, first frame 0.3 s
+  quirk off, 1000/1800     1/6 locked, 30 bounces per failure, 20 s
+---
+ .../media/pci/intel/ipu4/ipu4p-isys-csi2.c    | 59 ++++++++++++++++---
+ 1 file changed, 52 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/pci/intel/ipu4/ipu4p-isys-csi2.c b/drivers/media/pci/intel/ipu4/ipu4p-isys-csi2.c
+index b7923dbef..2e46b6140 100644
+--- a/drivers/media/pci/intel/ipu4/ipu4p-isys-csi2.c
++++ b/drivers/media/pci/intel/ipu4/ipu4p-isys-csi2.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ //  Copyright (C) 2018 Intel Corporation
+ 
++#include <linux/module.h>
+ #include "ipu.h"
+ #include "ipu-buttress.h"
+ #include "ipu-isys.h"
+@@ -13,6 +14,45 @@
+ #define CSI2_UPDATE_TIME_TRY_NUM   3
+ #define CSI2_UPDATE_TIME_MAX_DIFF  20
+ 
++/*
++ * Surface Pro 7 front camera (ov5693 on CSI-2 index 2 = firmware source 7,
++ * two lanes): the generic settle-count calculation gives a D-PHY link that
++ * locks only ~1-2% of the time per start. georgemihaila/sp7-ipu4-camera
++ * traced Windows' ConfigMipiClk for this receiver (350 MHz) and found it
++ * programs fixed counter values into the receiver delay registers, in a
++ * layout that does not match this driver's TERMEN/SETTLE naming:
++ *   0x30            <- 0
++ *   0x34            <- 1155   ("clock / first-data ticks")
++ *   0x38 + 8i       <- 0      (i = 0..7)
++ *   0x3c + 8i       <- 1269   ("data ticks")
++ * Runtime switch so the two timings can be A/B tested without a rebuild.
++ */
++static bool sp7_front_timing_quirk = true;
++module_param(sp7_front_timing_quirk, bool, 0644);
++MODULE_PARM_DESC(sp7_front_timing_quirk,
++		 "Surface Pro 7: use Windows' fixed receiver timing on the front (source-7, 2-lane) CSI-2 port (default 1)");
++
++static bool ipu4p_csi2_apply_sp7_front_timing(struct ipu_isys_csi2 *csi2,
++					      unsigned int nlanes)
++{
++	unsigned int i;
++
++	if (!sp7_front_timing_quirk || csi2->index != 2 || nlanes != 2 ||
++	    csi2->asd.source != IPU_FW_ISYS_STREAM_SRC_CSI2_PORT0 + 7)
++		return false;
++
++	writel(0, csi2->base + 0x30);
++	writel(1155, csi2->base + 0x34);
++	for (i = 0; i < 8; i++) {
++		writel(0, csi2->base + 0x38 + i * 8);
++		writel(1269, csi2->base + 0x3c + i * 8);
++	}
++	dev_info(&csi2->isys->adev->dev,
++		 "csi2-%u: SP7 front timing quirk applied (1155/1269 ticks)\n",
++		 csi2->index);
++	return true;
++}
++
+ static int ipu4p_csi2_ev_correction_params(struct ipu_isys_csi2
+ 					   *csi2, unsigned int lanes)
+ {
+@@ -156,13 +196,18 @@ int ipu_isys_csi2_set_stream(struct v4l2_subdev *sd,
+ 	writel(timing.csettle,
+ 		   csi2->base + CSI2_REG_CSI_RX_DLY_CNT_SETTLE_CLANE);
+ 
+-	for (i = 0; i < nlanes; i++) {
+-		writel
+-		    (timing.dtermen,
+-		     csi2->base + CSI2_REG_CSI_RX_DLY_CNT_TERMEN_DLANE(i));
+-		writel
+-		    (timing.dsettle,
+-		     csi2->base + CSI2_REG_CSI_RX_DLY_CNT_SETTLE_DLANE(i));
++	if (ipu4p_csi2_apply_sp7_front_timing(csi2, nlanes)) {
++		/* Windows programs the lane count before RX_CONFIG */
++		writel(nlanes, csi2->base + CSI2_REG_CSI_RX_NOF_ENABLED_LANES);
++	} else {
++		for (i = 0; i < nlanes; i++) {
++			writel
++			    (timing.dtermen,
++			     csi2->base + CSI2_REG_CSI_RX_DLY_CNT_TERMEN_DLANE(i));
++			writel
++			    (timing.dsettle,
++			     csi2->base + CSI2_REG_CSI_RX_DLY_CNT_SETTLE_DLANE(i));
++		}
+ 	}
+ 
+ 	val = readl(csi2->base + CSI2_REG_CSI_RX_CONFIG);
+-- 
+2.55.0
+

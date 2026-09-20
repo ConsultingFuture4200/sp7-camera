@@ -10,7 +10,7 @@ as a distro kernel package.
 |---|---|
 | IPU4P probe + CSE firmware authentication | works |
 | rear ov8865 3264x2448 RAW10 | works, 47,941,632 B for 3 frames |
-| front ov5693 2592x1944 RAW10 | works, 30,233,088 B, needs settle 880/1400 |
+| front ov5693 2592x1944 RAW10 | works, 30,233,088 B; reliable with patch 0059 (was: needs settle 880/1400) |
 | IR ov7251 | i2c probe -110, ignored (as upstream documents) |
 | `cam -l` | lists both cameras |
 | libcamera streaming | ~20 fps @ 1632x1224 through the software ISP |
@@ -54,7 +54,32 @@ header, so it gets the single-planar struct, which was missing
 `.vidioc_enum_framesizes`. libcamera's simple pipeline handler probes it, gets
 ENOTTY, and reports "No valid configuration found".
 
-## The settle counts (the front camera's real problem)
+## Update 2026-09-20: the front camera's real fix is the receiver timing
+
+The settle-count override below made the front camera *possible* (from 0% to
+roughly 1 in 3 cold starts, 30 sensor bounces on every failure). The actual fix
+is `patches/0059-*`: Windows does not use the driver's TERMEN/SETTLE
+calculation on this receiver at all, it writes fixed counters (1155 and 1269
+ticks) into the receiver delay registers and sets the lane count before
+RX_CONFIG. georgemihaila traced this from Windows' `ConfigMipiClk`
+(https://github.com/georgemihaila/sp7-ipu4-camera). Ported and scoped to the
+front port only, behind `sp7_front_timing_quirk` (default 1):
+
+    quirk on:                    6/6 cold starts locked, 0 bounces, first frame 0.3 s
+    quirk off, dsettle/csettle=1000/1800:  1/6, 30 bounces per failure, 20 s
+
+Log: `front-ab-2026-09-20.log`. Nothing else changed between the two runs.
+
+### Building note: BTF
+
+If you rebuild only the isys module against a tree whose `vmlinux` has been
+relinked since the kernel was installed, the module's `.BTF` section no longer
+matches the running kernel and it fails to load with
+`failed to validate module [intel_ipu4p_isys] BTF: -22`. Strip it before
+signing (`objcopy --remove-section=.BTF --remove-section=.BTF.ext`); the kernel
+skips the check when the section is absent.
+
+## The settle counts (the front camera's earlier workaround)
 
 The driver computes CSI-2 lane settle counts and uses the calculated **minimum**
 (dsettle=661, csettle=684 @419.2MHz). On this unit that fails D-PHY sync

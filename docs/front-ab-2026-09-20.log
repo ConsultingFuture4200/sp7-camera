@@ -1,0 +1,43 @@
+### quirk-go 2026-09-20T12:35:55-07:00  log: /home/bobmob/Projects/sp7-camera/quirk-go-123555.log
+== 1. install module (BTF stripped)
+   installed: 1327509 bytes
+   depmod done; modprobe will now resolve to:
+   /lib/modules/6.19.8-arch1-1-ipu4p/updates/intel-ipu4p-isys.ko.zst
+== 2. isys already loaded -> unloading to pick up the new module
+== 2. modprobe intel_ipu4p_isys
+   quirk param: Y  dsettle=880 csettle=1400
+   taint: 12288  media: /dev/media0 
+   Sep 20 12:35:58 surfacepro7 kernel: intel-ipu6 intel-ipu60: Entity type for entity Intel IPU4 CSI-2 5 was not initialized!
+   Sep 20 12:35:58 surfacepro7 kernel: intel-ipu6 intel-ipu60: initializing CSI-2 port 6
+   Sep 20 12:35:58 surfacepro7 kernel: intel-ipu6 intel-ipu60: CSI-2 6: default fw source 11
+   Sep 20 12:35:58 surfacepro7 kernel: intel-ipu6 intel-ipu60: Entity type for entity Intel IPU4 CSI-2 6 was not initialized!
+   Sep 20 12:35:58 surfacepro7 kernel: intel-ipu6 intel-ipu60: initializing CSI-2 port 7
+   Sep 20 12:35:58 surfacepro7 kernel: intel-ipu6 intel-ipu60: CSI-2 7: default fw source 12
+   Sep 20 12:35:58 surfacepro7 kernel: intel-ipu6 intel-ipu60: Entity type for entity Intel IPU4 CSI-2 7 was not initialized!
+   Sep 20 12:35:58 surfacepro7 kernel: intel-ipu6 intel-ipu60: Entity type for entity Intel IPU4 CSI2 BE SOC was not initialized!
+   Sep 20 12:35:58 surfacepro7 kernel: intel-ipu6 intel-ipu60: Entity type for entity Intel IPU4 CSI2 BE was not initialized!
+   Sep 20 12:35:58 surfacepro7 kernel: intel-ipu6 intel-ipu60: Entity type for entity Intel IPU4 ISA was not initialized!
+   Sep 20 12:35:58 surfacepro7 kernel: intel-ipu6 intel-ipu60: no subdevice info provided
+   Sep 20 12:35:58 surfacepro7 kernel: ov8865 i2c-INT347A:00: Instantiated dw9719 VCM
+== 3. front A/B (quirk on, then off with 1000/1800)
+### front ov5693 A/B, 6 cold starts each, 2026-09-20T12:36:01-07:00
+  == quirk-on ==
+    try 1  OK   bounces=0   first frame after 0.4s
+    try 1  OK   bounces=0   first frame after 0.4s
+    try 1  OK   bounces=0   first frame after 0.3s
+    try 1  OK   bounces=0   first frame after 0.3s
+    try 1  OK   bounces=0   first frame after 0.3s
+    try 1  OK   bounces=0   first frame after 0.3s
+  -> quirk-on: 6/6 locked; bounces when locked: 0 0 0 0 0 0
+     (quirk-applied log lines so far: 6)
+  == quirk-off-1000-1800 ==
+    try 1  fail bounces=30  first frame after 20.3s
+    try 1  fail bounces=30  first frame after 20.1s
+    try 1  fail bounces=30  first frame after 20.1s
+    try 1  fail bounces=30  first frame after 20.1s
+    try 1  fail bounces=30  first frame after 20.5s
+    try 1  OK   bounces=3   first frame after 2.3s
+  -> quirk-off-1000-1800: 1/6 locked; bounces when locked: 3
+     (quirk-applied log lines so far: 6)
+### restored: quirk=Y
+### done 2026-09-20T12:39:22-07:00  log: /home/bobmob/Projects/sp7-camera/quirk-go-123555.log

@@ -1,0 +1,7 @@
+# Surface Pro 7 rear-camera loopback (/dev/video60, v4l2loopback exclusive_caps=1).
+# udev's v4l_id probes the device when the module loads, before the relay feeds
+# it, so with exclusive_caps=1 it records ID_V4L_CAPABILITIES=":video_output:".
+# PipeWire's V4L2 monitor trusts that field and skips the device, even though it
+# reports Video Capture once fed. It is only ever used as a camera, so say so.
+# Runs after 60-persistent-v4l.rules, which sets the field from v4l_id.
+SUBSYSTEM=="video4linux", KERNEL=="video60", ATTR{name}=="Surface Pro 7 Rear Camera", ENV{ID_V4L_CAPABILITIES}=":capture:"
