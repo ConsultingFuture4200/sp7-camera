@@ -30,7 +30,7 @@ node=$(pw-dump 2>/dev/null | python3 -c "
 import json,sys
 for o in json.load(sys.stdin):
     p=(o.get('info') or {}).get('props') or {}
-    if p.get('api.v4l2.path')=='/dev/video60' and p.get('media.class'):
+    if p.get('api.v4l2.path')=='/dev/video60' and str(p.get('media.class','')).startswith('Video/Source'):
         print(p.get('node.description') or p.get('node.name')); break" 2>/dev/null)
 ok "PipeWire node for /dev/video60" "${node:-NONE}"
 p=$(busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.Camera IsCameraPresent 2>/dev/null)
