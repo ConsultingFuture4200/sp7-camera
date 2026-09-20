@@ -1,4 +1,24 @@
-# Rear camera (ov8865) sample frames
+# Sample frames
+
+## Front camera (ov5693), 2026-09-20
+
+With `patches/0059-*` (Windows receiver timing), libcamera simple pipeline +
+software ISP, colour matrices from `OV5693_MSHW0190_ICL.cpf`
+(`ipa/simple/ov5693.yaml`), gamma 1.8 / contrast 1.1 / saturation 1.4.
+Indoor daylight, mirroring corrected, otherwise untouched.
+
+| file | what it is |
+|---|---|
+| `front-2560x1600.jpg` | as delivered by the ISP (2560x1600 crop of the 2592x1944 mode), 0.3% clipped |
+| `front-1280x800.jpg` | half size |
+| `front-backlit-awb-green.jpg` | same setup, windows behind the subject: 22% of the frame clipped and the grey-world AWB goes green |
+
+Exposure controls sent through `libcamerasrc` (`exposure-value`,
+`ae-enable=false` + `exposure-time`/`analogue-gain`) are accepted but change
+nothing with the simple IPA here; the fix for the backlit case was turning
+around.
+
+## Rear camera (ov8865) sample frames
 
 Surface Pro 7 (1866), linux-ipu4p 6.19.8, `ruslanbay/ipu4-drivers` v6.19 series
 + the `thisiscamk` delta + the two fixes in `patches/0058-*`. Captured through
