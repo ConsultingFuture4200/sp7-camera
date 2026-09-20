@@ -10,12 +10,14 @@ python3 -c "import os; os.close(os.open('/dev/video42', os.O_RDWR))" 2>/dev/null
   && ok "camera island healthy" "yes" || { ok "camera island healthy" "NO (EIO) - reboot"; exit 1; }
 
 echo "=== loopback + relay ==="
-if [ -e /dev/video60 ]; then
-  ok "/dev/video60" "$(v4l2-ctl -d /dev/video60 --info 2>/dev/null | awk -F': *' '/Card type/{print $2}')"
-else
-  ok "/dev/video60" "MISSING - sudo ~/camsetup (first time) or sudo ~/loadcam"
-fi
-ok "relay service" "$(systemctl --user is-active sp7-camera-relay)"
+for d in 60 61; do
+  if [ -e /dev/video$d ]; then
+    ok "/dev/video$d" "$(v4l2-ctl -d /dev/video$d --info 2>/dev/null | awk -F': *' '/Card type/{print $2}')"
+  else
+    ok "/dev/video$d" "MISSING - sudo ~/loadcam (video61: sudo ~/camfront once)"
+  fi
+done
+ok "relay services (rear front)" "$(systemctl --user is-active sp7-camera-relay sp7-camera-relay-front | paste -sd' ')"
 last=$(journalctl --user -u sp7-camera-relay -n 50 --no-pager -o cat 2>/dev/null | grep -E 'camera ON|camera OFF|idle, feeding|waiting for' | tail -1)
 case "$last" in
   *"camera ON"*)  ok "camera right now" "ON (an app is streaming)";;
@@ -30,9 +32,9 @@ node=$(pw-dump 2>/dev/null | python3 -c "
 import json,sys
 for o in json.load(sys.stdin):
     p=(o.get('info') or {}).get('props') or {}
-    if p.get('api.v4l2.path')=='/dev/video60' and str(p.get('media.class','')).startswith('Video/Source'):
-        print(p.get('node.description') or p.get('node.name')); break" 2>/dev/null)
-ok "PipeWire node for /dev/video60" "${node:-NONE}"
+    if str(p.get('api.v4l2.path','')).startswith('/dev/video6') and str(p.get('media.class','')).startswith('Video/Source'):
+        print(p.get('node.description') or p.get('node.name'))" 2>/dev/null | paste -sd'|')
+ok "PipeWire camera nodes" "${node:-NONE}"
 p=$(busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.Camera IsCameraPresent 2>/dev/null)
 ok "portal IsCameraPresent" "${p:-unknown}"
 

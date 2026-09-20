@@ -1,5 +1,14 @@
 # On-demand camera relay for ordinary applications
 
+Two instances, one per camera (`SP7_CAMERA=rear|front`), each feeding its own
+loopback: `/dev/video60` "Surface Pro 7 Rear Camera" and `/dev/video61`
+"Surface Pro 7 Front Camera" (`scripts/v4l2loopback-sp7.conf`; note
+`card_label` must be ONE quoted comma-separated string). Chrome lists both.
+libcamera's pipeline handler locks the whole IPU media device while streaming,
+so the two cameras cannot run at the same time from two processes; the second
+one shows black until the first stops (Chrome only opens one at a time).
+`scripts/add-front-loopback.sh` does the root part (module reload, udev rule).
+
 `sp7-camera-relay.py` bridges libcamera to a `v4l2loopback` node so apps that
 only speak V4L2 / PipeWire-v4l2 (Chrome, OBS, etc.) see a normal webcam.
 

@@ -1,11 +1,11 @@
 [Unit]
-Description=Surface Pro 7 rear camera on demand (v4l2loopback /dev/video60)
+Description=Surface Pro 7 front camera on demand (v4l2loopback /dev/video61)
 Documentation=file://%h/Projects/sp7-camera/tools/sp7-camera-relay.py
 After=wireplumber.service
 
 [Service]
-# Idles cheaply until /dev/video60 exists (sudo ~/loadcam), then keeps the
-# loopback valid and runs the camera only while an app streams from it.
+Environment=SP7_CAMERA=front SP7_LOOPBACK=/dev/video61 SP7_SENSOR_W=2560 SP7_SENSOR_H=1600
+Environment=LIBCAMERA_IPA_CONFIG_PATH=%h/Projects/sp7-camera/ipa
 ExecStart=/usr/bin/python3 %h/Projects/sp7-camera/tools/sp7-camera-relay.py
 Restart=always
 RestartSec=5

@@ -1,5 +1,8 @@
 #!/usr/bin/python3
-"""On-demand relay: Surface Pro 7 rear camera -> v4l2loopback webcam.
+"""On-demand relay: Surface Pro 7 camera (rear or front) -> v4l2loopback webcam.
+
+One instance per camera: SP7_CAMERA=rear|front, SP7_LOOPBACK=/dev/videoNN,
+SP7_SENSOR_W/H (rear 3200x2400, front 2560x1600).
 
 The camera runs only while an application is actually streaming from
 /dev/video60, and stops a few seconds after the last one stops.
@@ -41,8 +44,13 @@ except (ValueError, ImportError, AttributeError):
     _signal_add = GLib.unix_signal_add
     _fd_add = GLib.unix_fd_add_full
 
-CAMERA = r'\_SB_.PCI0.I2C3.CAMR'                       # REAR camera only
+CAMERAS = {'rear': r'\_SB_.PCI0.I2C3.CAMR',            # ov8865, CSI-2 port 0
+           'front': r'\_SB_.PCI0.I2C2.CAMF'}           # ov5693, CSI-2 port 2 (needs patch 0059)
+WHICH = os.environ.get('SP7_CAMERA', 'rear')
+CAMERA = CAMERAS.get(WHICH, WHICH)                      # keyword, or a raw libcamera camera-name
 DEV = os.environ.get('SP7_LOOPBACK', '/dev/video60')
+# both sensors deliver a horizontally mirrored image; 'none' to pass through
+FLIP = os.environ.get('SP7_FLIP', 'horizontal-flip')
 SW = int(os.environ.get('SP7_SENSOR_W', 3200)); SH = int(os.environ.get('SP7_SENSOR_H', 2400))
 OW = int(os.environ.get('SP7_OUT_W', 1280));    OH = int(os.environ.get('SP7_OUT_H', 720))
 STOP_GRACE_S, RESYNC_S, MAX_START_RETRIES = 3, 10, 3
@@ -104,7 +112,7 @@ class Relay:
             f'! video/x-raw,format=YUY2,width={OW},height={OH} '
             # the ov8865 delivers a horizontally mirrored image (its subdev reports
             # horizontal_flip=1 and vertical_flip=1); un-mirror at 1280x720 where it's cheap
-            f'! videoflip method=horizontal-flip '
+            f'! videoflip method={FLIP} '
             f'! appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false')
         src = self.inp.get_by_name('src')
         src.set_property('camera-name', CAMERA)
@@ -121,7 +129,7 @@ class Relay:
                 log(f'{knob} not settable: {e}')
         self.inp.get_by_name('sink').connect('new-sample', self.on_sample)
         bus = self.inp.get_bus(); bus.add_signal_watch(); bus.connect('message', self.on_in_msg)
-        log(f'app streaming -> camera ON ({SW}x{SH} -> {OW}x{OH})')
+        log(f'app streaming -> {WHICH} camera ON ({SW}x{SH} -> {OW}x{OH})')
         self.inp.set_state(Gst.State.PLAYING)
         if not self.resync_timer:
             self.resync_timer = GLib.timeout_add_seconds(RESYNC_S, self.resync)
