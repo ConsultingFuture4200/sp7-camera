@@ -217,7 +217,12 @@ class Relay:
     def ensure_pipewire_node(self):
         try:
             objs = json.loads(subprocess.run(['pw-dump'], capture_output=True, text=True, timeout=10).stdout or '[]')
-            present = any((o.get('info') or {}).get('props', {}).get('api.v4l2.path') == DEV for o in objs)
+            # A Video/Device object alone is not enough: wireplumber creates the
+            # Video/Source node only if the loopback reported capture caps when the
+            # device was probed. Require the node.
+            present = any((o.get('info') or {}).get('props', {}).get('api.v4l2.path') == DEV and
+                          str((o.get('info') or {}).get('props', {}).get('media.class', '')).startswith('Video/Source')
+                          for o in objs)
         except Exception as e:
             log(f'pw-dump failed: {e}'); return False
         if present:

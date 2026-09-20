@@ -17,3 +17,21 @@ only speak V4L2 / PipeWire-v4l2 (Chrome, OBS, etc.) see a normal webcam.
   `~/.config/systemd/user/`, the two WirePlumber snippets to
   `~/.config/wireplumber/wireplumber.conf.d/`, `chrome-flags.conf` to
   `~/.config/`, then `systemctl --user enable --now sp7-camera-relay`.
+
+## WirePlumber 0.5.17 bug: one disabled V4L2 device hides every later one
+
+`50-sp7-ipu4.conf` disables the ~55 raw IPU4 V4L2 nodes with a
+`monitor.v4l2.rules` rule (`device.disabled = true`). In WirePlumber 0.5.17
+`monitors/v4l2/create-device.lua` handles that case by returning from an
+**AsyncEventHook without `transition:advance()`**, so the dispatcher stalls and
+no V4L2 device enumerated after the first disabled one is ever created. The
+libcamera device hook and the V4L2 node hook both advance; only this one does
+not. Symptom: the loopback appears in PipeWire only when udev happens to
+enumerate it before an IPU node, and `IsCameraPresent` is false.
+
+`wireplumber-scripts/monitors/v4l2/create-device.lua` is the upstream script
+with the missing `transition:advance()` added. Install it as
+`~/.local/share/wireplumber/scripts/monitors/v4l2/create-device.lua`
+(WirePlumber does **not** look in `~/.config/wireplumber/scripts/`), restart
+`wireplumber`, and all 55 raw nodes are disabled while the loopback becomes
+`Surface Pro 7 Rear Camera (V4L2)` with the camera portal reporting a camera.
