@@ -9,7 +9,7 @@ Indoor daylight, mirroring corrected, otherwise untouched.
 
 | file | what it is |
 |---|---|
-| `front-2560x1600.jpg` | as delivered by the ISP (2560x1600 crop of the 2592x1944 mode), 0.3% clipped |
+| `front-2560x1600.jpg` | as delivered by the ISP (2560x1600 crop of the 2592x1944 mode), 0.3% clipped. Row 1051 is a single corrupted (magenta) line, a transient CSI-2 line error; two frames captured right after were clean. Left in deliberately. |
 | `front-1280x800.jpg` | half size |
 | `front-backlit-awb-green.jpg` | same setup, windows behind the subject: 22% of the frame clipped and the grey-world AWB goes green |
 
